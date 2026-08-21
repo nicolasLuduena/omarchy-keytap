@@ -45,10 +45,11 @@ BarWidget {
     text: "\uF11C"
     active: root.enabled
     tooltipText: root.enabled
-      ? "Keytap: showing keystrokes — click to hide"
-      : "Keytap: hidden — click to show"
+      ? "Keytap: showing keystrokes\nClick: toggle · Right-click: reposition"
+      : "Keytap: hidden\nClick: show · Right-click: reposition"
     onPressed: function(b) {
-      root.bar.run("omarchy-shell -q keytap toggle")
+      if (b === Qt.RightButton) root.bar.run("omarchy-shell -q keytap drag")
+      else root.bar.run("omarchy-shell -q keytap toggle")
     }
   }
 }
