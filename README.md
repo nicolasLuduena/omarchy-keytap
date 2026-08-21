@@ -1,22 +1,23 @@
 # Keytap
 
 An on-screen keypress visualizer for [Omarchy](https://omarchy.org/) — a floating,
-theme-aware pill near the bottom of the screen that pops up your key combos as
-styled keycaps:
+theme-aware rolling cluster near the bottom of the screen where every chord you
+press leaves a keycap bubble:
 
 ```
-        ┌──────────────────────────────┐
-        │  [Ctrl] + [Shift] + [T]      │
-        └──────────────────────────────┘
+   ┌───────┐ ┌───────┐ ┌──────────────────┐
+   │  [A]  │ │  [L]  │ │ [Ctrl] + [S]     │
+   └───────┘ └───────┘ └──────────────────┘
 ```
 
-- **Live combos** — modifiers update while held; the pill pulses on every new key
-- **Lingers, then fades** — combos stay ~3s and dissolve slowly instead of vanishing
-- **Draggable** — right-click the bar icon (or IPC `drag`), move the pill anywhere,
+- **Rolling history** — several recent chords stay visible at once; newest on the right
+- **Lingers, then dissolves** — each bubble holds ~3s, then slowly fades out individually
+- **Live chords** — while held, a bubble updates in place (Super → Super+Shift → Super+Shift+T)
+- **Draggable** — right-click the bar icon (or IPC `drag`), move the cluster anywhere,
   position saves on release
 - **Theme-aware** — colors, radius, and fonts follow your Omarchy theme
 - **Click-through** — the overlay never intercepts mouse or keyboard input
-  (except the pill itself while in drag mode)
+  (except the cluster itself while in drag mode)
 - **Global capture** — reads evdev devices directly (you need to be in the
   `input` group; no root daemon)
 
@@ -40,7 +41,7 @@ omarchy bar move batman.keytap --section right
 
 ## Use
 
-- Type — combos appear as a pill and fade out after a moment
+- Type — chords appear as keycap bubbles that linger, then slowly dissolve
 - Click the keyboard icon in the bar (or IPC below) to toggle the overlay
 - Settings persist across restarts in `~/.local/state/batman.keytap/state.json`
 
@@ -50,7 +51,7 @@ omarchy bar move batman.keytap --section right
 omarchy-shell keytap toggle   # on/off
 omarchy-shell keytap show     # force on
 omarchy-shell keytap hide     # force off
-omarchy-shell keytap drag     # toggle drag mode — move the pill, release to save
+omarchy-shell keytap drag     # toggle drag mode — move the cluster, release to save
 omarchy-shell keytap state    # JSON: {enabled, duration, marginBottom, posX, posY, dragMode}
 ```
 
@@ -73,14 +74,15 @@ omarchy-shell shell summon batman.keytap '{"duration": 2500, "marginBottom": 160
 
 State file `~/.local/state/batman.keytap/state.json`:
 
-| Key            | Default        | Meaning                                        |
-|----------------|----------------|------------------------------------------------|
-| `enabled`      | `true`         | Visualizer on/off (bar widget toggles this)    |
-| `duration`     | `3200`         | ms a combo lingers before the slow fade starts |
-| `marginBottom` | `110`          | Default pill height above the screen bottom    |
-| `posX`/`posY`  | unset          | Pill center; written when you drag it          |
+| Key            | Default        | Meaning                                          |
+|----------------|----------------|--------------------------------------------------|
+| `enabled`      | `true`         | Visualizer on/off (bar widget toggles this)      |
+| `duration`     | `3200`         | ms each bubble lingers before its slow fade      |
+| `maxEntries`   | `5`            | Bubbles kept visible at once (oldest drops first)|
+| `marginBottom` | `110`          | Default cluster height above the screen bottom   |
+| `posX`/`posY`  | unset          | Cluster center; written when you drag it         |
 
-Drag mode auto-exits after ~6s idle. Until the first drag, the pill sits
+Drag mode auto-exits after ~6s idle. Until the first drag, the cluster sits
 bottom-center at `marginBottom`.
 
 Environment (set for the shell process, e.g. via systemd override):
@@ -97,7 +99,7 @@ Environment (set for the shell process, e.g. via systemd override):
                                                               │
                                         Quickshell Process ◀──┘
                                                 │
-                              KeytapPanel.qml ──▶ layer-shell overlay pill
+                              KeytapPanel.qml ──▶ layer-shell overlay bubbles
 ```
 
 The collector tracks modifier state across all keyboards, filters autorepeat,

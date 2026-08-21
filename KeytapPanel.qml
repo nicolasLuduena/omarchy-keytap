@@ -7,18 +7,23 @@ import qs.Ui
 
 // Keytap — on-screen keypress visualizer.
 //
-// A floating theme-aware pill that renders the live key combo as styled
-// keycaps, lingers, then slowly fades away. Key events come from the bundled
-// Python collector (`keytap-collector`), which reads evdev devices directly
-// and emits one JSON line per state change:
+// Every chord you press leaves a themed bubble in a small rolling cluster:
+// the newest sits at the right end, each bubble lingers for `duration`,
+// then slowly dissolves individually. While a chord is still held, its
+// bubble updates live (Super -> Super+Shift -> Super+Shift+T).
+//
+// Key events come from the bundled Python collector (`keytap-collector`),
+// which reads evdev devices directly and emits one JSON line per state
+// change:
 //
 //   {"seq": 3, "combo": ["Ctrl", "Shift", "T"]}
 //
-// An empty combo array means every key was released -> begin the slow fade.
+// An empty combo array means every key was released -> the active bubble
+// finalizes into the history row and starts its linger timer.
 //
-// The pill can be repositioned: enter drag mode via the bar widget's right
-// click or `omarchy-shell keytap drag`, drag it anywhere, and the position
-// persists to the shared state file.
+// The cluster can be repositioned: enter drag mode via the bar widget's
+// right click or `omarchy-shell keytap drag`, drag it anywhere, and the
+// position persists to the shared state file.
 Item {
   id: root
 
@@ -28,19 +33,25 @@ Item {
 
   // Panel contract: opened == visualizer enabled.
   property bool opened: true
-  property var combo: []
-  property bool showing: false
 
   // Settings, persisted to the shared state file.
   property int duration: 3200
   property int marginBottom: 110
+  property int maxEntries: 5
 
-  // Free position of the pill center in window coordinates. -1 = unset,
+  // Free position of the cluster center in window coordinates. -1 = unset,
   // fall back to the bottom-center default until first drag.
   property real posX: -1
   property real posY: -1
   readonly property bool hasStoredPosition: posX >= 0 && posY >= 0
   property bool dragMode: false
+
+  // Finalized bubbles: [{id, cells}]. The active (still-held) chord renders
+  // separately so history delegates never mutate after creation.
+  property var history: []
+  property var activeCells: []
+  readonly property bool hasActive: activeCells.length > 0
+  property int nextEntryId: 1
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateDir: home + "/.local/state/batman.keytap"
@@ -55,17 +66,6 @@ Item {
 
   readonly property var modifierNames: ["Ctrl", "Super", "Alt", "AltGr", "Shift"]
 
-  // Alternating [{sep:true},{label,mod}] model so the Row can interleave "+".
-  readonly property var displayCombo: {
-    var out = []
-    for (var i = 0; i < root.combo.length; i++) {
-      if (i > 0) out.push({ sep: true })
-      var label = String(root.combo[i])
-      out.push({ label: label, mod: root.modifierNames.indexOf(label) !== -1 })
-    }
-    return out
-  }
-
   function applyState(raw) {
     var obj
     try { obj = JSON.parse(String(raw || "")) } catch (e) { return }
@@ -73,6 +73,7 @@ Item {
     if (typeof obj.enabled === "boolean" && obj.enabled !== root.opened) root.opened = obj.enabled
     if (typeof obj.duration === "number" && isFinite(obj.duration)) root.duration = Math.max(400, obj.duration)
     if (typeof obj.marginBottom === "number" && isFinite(obj.marginBottom)) root.marginBottom = Math.max(24, obj.marginBottom)
+    if (typeof obj.maxEntries === "number" && isFinite(obj.maxEntries)) root.maxEntries = Math.min(12, Math.max(1, Math.round(obj.maxEntries)))
     if (typeof obj.posX === "number" && isFinite(obj.posX) && obj.posX >= 0) root.posX = obj.posX
     if (typeof obj.posY === "number" && isFinite(obj.posY) && obj.posY >= 0) root.posY = obj.posY
   }
@@ -91,16 +92,8 @@ Item {
   function setDragMode(value) {
     if (root.dragMode === value) return
     root.dragMode = value
-    if (value) {
-      root.showing = true
-      hideTimer.stop()
-      dragIdle.restart()
-      fadeIn.restart()
-    } else {
-      dragIdle.stop()
-      hideTimer.interval = Math.max(400, root.duration)
-      hideTimer.restart()
-    }
+    if (value) dragIdle.restart()
+    else dragIdle.stop()
   }
 
   // Shell summon contract (omarchy-shell shell summon batman.keytap '{...}').
@@ -110,6 +103,7 @@ Item {
       if (p && typeof p === "object") {
         if (typeof p.duration === "number" && isFinite(p.duration)) root.duration = Math.max(400, p.duration)
         if (typeof p.marginBottom === "number" && isFinite(p.marginBottom)) root.marginBottom = Math.max(24, p.marginBottom)
+        if (typeof p.maxEntries === "number" && isFinite(p.maxEntries)) root.maxEntries = Math.min(12, Math.max(1, Math.round(p.maxEntries)))
         if (typeof p.posX === "number" && isFinite(p.posX) && p.posX >= 0) root.posX = p.posX
         if (typeof p.posY === "number" && isFinite(p.posY) && p.posY >= 0) root.posY = p.posY
       }
@@ -124,48 +118,48 @@ Item {
       if (!collector.running) collector.running = true
     } else {
       collector.running = false
-      root.combo = []
-      root.showing = false
+      root.history = []
+      root.activeCells = []
     }
   }
 
   onOpenedChanged: syncCollector()
   Component.onCompleted: syncCollector()
 
+  // Alternating [{sep:true},{label,mod}] cells so Rows can interleave "+".
+  function cellsFor(combo) {
+    var out = []
+    for (var i = 0; i < combo.length; i++) {
+      if (i > 0) out.push({ sep: true })
+      var label = String(combo[i])
+      out.push({ label: label, mod: root.modifierNames.indexOf(label) !== -1 })
+    }
+    return out
+  }
+
+  function removeEntry(id) {
+    root.history = root.history.filter(function(e) { return e.id !== id })
+  }
+
   function handleLine(line) {
     line = String(line || "").trim()
     if (line === "") return
     var payload
     try { payload = JSON.parse(line) } catch (e) { return }
-    var next = Array.isArray(payload.combo) ? payload.combo.map(String) : []
+    var combo = Array.isArray(payload.combo) ? payload.combo.map(String) : []
 
-    if (next.length === 0) {
-      root.combo = []
-      if (!root.dragMode) {
-        root.showing = false
-        fadeOut.restart()
+    if (combo.length === 0) {
+      // All keys released: finalize the active chord into history.
+      if (root.hasActive) {
+        var withNew = root.history.concat([{ id: root.nextEntryId++, cells: root.activeCells }])
+        root.history = withNew.slice(-root.maxEntries)
+        root.activeCells = []
       }
       return
     }
 
-    var wasShowing = root.showing
-    root.combo = next
-    root.showing = true
-    hideTimer.interval = Math.max(400, root.duration)
-    hideTimer.restart()
-    if (wasShowing) pulseAnim.restart()
-    else popIn.restart()
-    fadeIn.restart()
-  }
-
-  Timer {
-    id: hideTimer
-    interval: root.duration
-    onTriggered: {
-      if (root.dragMode) return
-      root.showing = false
-      fadeOut.restart()
-    }
+    // Chord in progress: the active bubble updates live until release.
+    root.activeCells = root.cellsFor(combo)
   }
 
   Timer {
@@ -198,6 +192,7 @@ Item {
         enabled: root.opened,
         duration: root.duration,
         marginBottom: root.marginBottom,
+        maxEntries: root.maxEntries,
         posX: Math.round(root.posX),
         posY: Math.round(root.posY)
       }, null, 2) + "\n")
@@ -243,6 +238,7 @@ Item {
         enabled: root.opened,
         duration: root.duration,
         marginBottom: root.marginBottom,
+        maxEntries: root.maxEntries,
         posX: Math.round(root.posX),
         posY: Math.round(root.posY),
         dragMode: root.dragMode
@@ -252,46 +248,182 @@ Item {
     function ping(): string { return "ok" }
   }
 
+  // One keycap chip. `label`/`mod` are set by the owning Repeater delegate.
+  component KeyCap: Rectangle {
+    property string label: ""
+    property bool mod: false
+
+    implicitWidth: capLabel.implicitWidth + 2 * Style.space(10)
+    implicitHeight: capLabel.implicitHeight + 2 * Style.space(7)
+    radius: Style.space(7)
+    color: Util.alpha(Color.popups.text, mod ? 0.06 : 0.10)
+    border.width: 1
+    border.color: mod ? Util.alpha(Color.popups.text, 0.18) : Util.alpha(Color.accent, 0.55)
+
+    // Keycap depth: a subtle darker lip along the bottom edge.
+    Rectangle {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      height: Math.max(1, Style.space(2))
+      radius: height / 2
+      color: Util.alpha("#000000", 0.30)
+    }
+
+    Text {
+      id: capLabel
+      anchors.centerIn: parent
+      text: parent.label
+      font.family: Style.font.family
+      font.pixelSize: Style.font.title
+      font.bold: true
+      color: parent.mod ? Util.alpha(Color.popups.text, 0.78) : Color.popups.text
+    }
+  }
+
+  // A chord rendered as chips with "+" separators.
+  component ChipRow: Row {
+    property var cells: []
+    spacing: Style.space(8)
+
+    Repeater {
+      model: parent.cells
+
+      delegate: Item {
+        id: slot
+        required property var modelData
+        readonly property bool isSep: !!modelData.sep
+        readonly property string label: modelData.label || ""
+
+        width: isSep ? plus.implicitWidth : cap.implicitWidth
+        height: Math.max(plus.implicitHeight, cap.implicitHeight)
+
+        Text {
+          id: plus
+          visible: slot.isSep
+          anchors.centerIn: parent
+          text: "+"
+          font.family: Style.font.family
+          font.pixelSize: Style.font.subtitle
+          color: Color.muted
+        }
+
+        KeyCap {
+          id: cap
+          visible: !slot.isSep
+          anchors.centerIn: parent
+          label: slot.label
+          mod: !!modelData.mod
+        }
+      }
+    }
+  }
+
+  // A finished chord: pops in, lingers, slowly dissolves, removes itself.
+  // Content never mutates after creation, so the plain-array model is safe.
+  component ComboBubble: BorderSurface {
+    id: bubble
+    property var cells: []
+    property int entryId: 0
+    property bool isLive: false
+
+    readonly property int padX: Style.space(14)
+    readonly property int padY: Style.space(12)
+
+    width: borderLeft + padX + innerRow.implicitWidth + padX + borderRight
+    height: borderTop + padY + innerRow.implicitHeight + padY + borderBottom
+    radius: Math.max(Style.cornerRadius, Style.space(14))
+    color: Util.alpha(Color.popups.background, 0.97)
+    borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+    transformOrigin: Item.Center
+
+    Component.onCompleted: {
+      if (!isLive) {
+        popIn.restart()
+        lifeTimer.restart()
+      }
+    }
+
+    Timer {
+      id: lifeTimer
+      interval: root.duration
+      running: false
+      onTriggered: dissolve.start()
+    }
+
+    SequentialAnimation {
+      id: popIn
+      NumberAnimation {
+        target: bubble; property: "scale"; from: 0.7; to: 1
+        duration: 240; easing.type: Easing.OutBack
+      }
+    }
+
+    SequentialAnimation {
+      id: dissolve
+      ParallelAnimation {
+        NumberAnimation {
+          target: bubble; property: "opacity"; from: 1; to: 0
+          duration: 1100; easing.type: Easing.InQuad
+        }
+        NumberAnimation {
+          target: bubble; property: "scale"; from: 1; to: 0.92
+          duration: 1100; easing.type: Easing.InQuad
+        }
+      }
+      ScriptAction { script: if (bubble.entryId > 0) root.removeEntry(bubble.entryId) }
+    }
+
+    ChipRow {
+      id: innerRow
+      anchors.centerIn: parent
+      cells: bubble.cells
+    }
+  }
+
   PanelWindow {
     id: panelWindow
-    visible: root.opened
+    visible: root.opened && (root.history.length > 0 || root.hasActive || root.dragMode)
     color: "transparent"
     anchors { top: true; bottom: true; left: true; right: true }
     WlrLayershell.namespace: "batman-keytap"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
-    // Click-through everywhere except the pill while dragging: a zero-sized
-    // region receives no input, so the desktop below stays fully interactive.
+    // Click-through everywhere except the cluster while dragging: a
+    // zero-sized region receives no input, so the desktop below stays
+    // fully interactive.
     mask: Region {
-      x: root.dragMode ? pill.x : 0
-      y: root.dragMode ? pill.y : 0
-      width: root.dragMode ? pill.width : 0
-      height: root.dragMode ? pill.height : 0
+      x: root.dragMode ? cluster.x : 0
+      y: root.dragMode ? cluster.y : 0
+      width: root.dragMode ? cluster.width : 0
+      height: root.dragMode ? cluster.height : 0
     }
 
-    BorderSurface {
-      id: pill
-      visible: root.showing && (root.combo.length > 0 || root.dragMode)
-      opacity: root.showing ? 1 : 0
-      transformOrigin: Item.Center
+    ComboBubble {
+      id: ghost
+      visible: root.dragMode && !root.hasActive && root.history.length === 0
+      cells: [{ label: "Keytap", mod: false }]
 
-      readonly property int padX: Style.space(14)
-      readonly property int padY: Style.space(12)
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.bottom
+        anchors.topMargin: Style.space(6)
+        text: "drag me — position saves on release"
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        color: Color.muted
+      }
+    }
 
-      width: borderLeft + padX + row.implicitWidth + padX + borderRight
-      height: borderTop + padY + row.implicitHeight + padY + borderBottom
-      radius: Math.max(Style.cornerRadius, Style.space(14))
-      color: Util.alpha(Color.popups.background, 0.97)
-      borderSpec: Border.surfaceSpec(
-        "popups", "border",
-        root.dragMode ? Color.accent : Color.popups.border,
-        Math.max(1, Style.space(2))
-      )
+    // The rolling cluster: finalized bubbles, then the live chord, all
+    // centered on the stored position point.
+    Item {
+      id: cluster
+      width: contentRow.implicitWidth
+      height: contentRow.implicitHeight
+      visible: root.history.length > 0 || root.hasActive
 
-      // Stored position wins once dragged; otherwise stay bottom-center.
-      // Pure bindings so a bogus or missing stored value self-corrects and
-      // the pill tracks window resizes without imperative init races.
       x: {
         var cx = root.hasStoredPosition ? root.posX : panelWindow.width / 2
         var half = width / 2
@@ -303,41 +435,28 @@ Item {
         return Math.min(Math.max(cy - halfY, 0), Math.max(0, panelWindow.height - height))
       }
 
-      SequentialAnimation {
-        id: fadeIn
-        NumberAnimation {
-          target: pill; property: "opacity"; from: 0; to: 1
-          duration: 160; easing.type: Easing.OutQuad
-        }
-      }
+      Behavior on x { enabled: !root.dragMode; NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+      Behavior on y { enabled: !root.dragMode; NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
 
-      SequentialAnimation {
-        id: fadeOut
-        ParallelAnimation {
-          NumberAnimation {
-            target: pill; property: "opacity"; from: 1; to: 0
-            duration: 1100; easing.type: Easing.InQuad
-          }
-          NumberAnimation {
-            target: pill; property: "scale"; from: 1; to: 0.96
-            duration: 1100; easing.type: Easing.InQuad
+      Row {
+        id: contentRow
+        spacing: Style.space(8)
+
+        Repeater {
+          model: root.history
+
+          delegate: ComboBubble {
+            required property var modelData
+            cells: modelData.cells
+            entryId: modelData.id
           }
         }
-      }
 
-      SequentialAnimation {
-        id: popIn
-        NumberAnimation {
-          target: pill; property: "scale"; from: 0.88; to: 1
-          duration: 260; easing.type: Easing.OutBack
-        }
-      }
-
-      SequentialAnimation {
-        id: pulseAnim
-        NumberAnimation {
-          target: pill; property: "scale"; from: 1.05; to: 1
-          duration: 140; easing.type: Easing.OutCubic
+        ComboBubble {
+          visible: root.hasActive
+          isLive: true
+          cells: root.activeCells
+          borderSpec: Border.surfaceSpec("popups", "border", Color.accent, Math.max(1, Style.space(2)))
         }
       }
 
@@ -370,85 +489,17 @@ Item {
           dragIdle.restart()
         }
       }
-
-      Row {
-        id: row
-        anchors.fill: parent
-        anchors.topMargin: pill.borderTop + pill.padY
-        anchors.rightMargin: pill.borderRight + pill.padX
-        anchors.bottomMargin: pill.borderBottom + pill.padY
-        anchors.leftMargin: pill.borderLeft + pill.padX
-        spacing: Style.space(8)
-
-        Repeater {
-          model: root.displayCombo
-
-          delegate: Item {
-            id: slot
-            required property var modelData
-            readonly property bool isSep: !!modelData.sep
-            readonly property string label: modelData.label || ""
-
-            width: isSep ? plus.implicitWidth : cap.implicitWidth
-            height: Math.max(plus.implicitHeight, cap.implicitHeight)
-
-            Text {
-              id: plus
-              visible: slot.isSep
-              anchors.centerIn: parent
-              text: "+"
-              font.family: Style.font.family
-              font.pixelSize: Style.font.subtitle
-              color: Color.muted
-            }
-
-            Rectangle {
-              id: cap
-              visible: !slot.isSep
-              anchors.centerIn: parent
-              implicitWidth: capLabel.implicitWidth + 2 * Style.space(10)
-              implicitHeight: capLabel.implicitHeight + 2 * Style.space(7)
-              radius: Style.space(7)
-              color: Util.alpha(Color.popups.text, modelData.mod ? 0.06 : 0.10)
-              border.width: 1
-              border.color: modelData.mod
-                ? Util.alpha(Color.popups.text, 0.18)
-                : Util.alpha(Color.accent, 0.55)
-
-              // Keycap depth: a subtle darker lip along the bottom edge.
-              Rectangle {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                height: Math.max(1, Style.space(2))
-                radius: height / 2
-                color: Util.alpha("#000000", 0.30)
-              }
-
-              Text {
-                id: capLabel
-                anchors.centerIn: parent
-                text: slot.label
-                font.family: Style.font.family
-                font.pixelSize: Style.font.title
-                font.bold: true
-                color: modelData.mod ? Util.alpha(Color.popups.text, 0.78) : Color.popups.text
-              }
-            }
-          }
-        }
-      }
     }
 
     Text {
       id: dragHint
-      visible: root.dragMode
+      visible: root.dragMode && cluster.visible
       text: "drag me — position saves on release"
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
       color: Color.muted
-      x: pill.x + pill.width / 2 - width / 2
-      y: pill.y + pill.height + Style.space(6)
+      x: cluster.x + cluster.width / 2 - width / 2
+      y: cluster.y + cluster.height + Style.space(6)
     }
   }
 }
