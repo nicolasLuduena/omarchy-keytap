@@ -23,7 +23,7 @@ styled keycaps:
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/keytap.git --enable
+omarchy plugin add https://github.com/nicolasLuduena/omarchy-keytap.git --enable
 ```
 
 Or from a local checkout:
